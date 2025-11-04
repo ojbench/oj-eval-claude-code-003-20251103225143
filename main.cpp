@@ -98,11 +98,7 @@ static void recompute_visible(Team &t) {
 }
 
 static void flush_scoreboard(SystemState &S) {
-    // recompute visible metrics for all teams
-    for (auto &kv : S.teams) {
-        recompute_visible(kv.second);
-    }
-    // sort per RankCmp
+    // Sort using already-maintained visible metrics
     vector<string> order;
     order.reserve(S.teams.size());
     for (auto &kv : S.teams) order.push_back(kv.first);
@@ -113,13 +109,11 @@ static void flush_scoreboard(SystemState &S) {
 
 static void print_scoreboard(const SystemState &S) {
     // Output N lines: team_name ranking solved_count total_penalty A B C ...
-    // ranking index is 1-based position in last_scoreboard_order
-    unordered_map<string,int> rank_idx;
-    for (int i = 0; i < (int)S.last_scoreboard_order.size(); ++i) rank_idx[S.last_scoreboard_order[i]] = i+1;
-    for (const string &name : S.last_scoreboard_order) {
+    const auto &order = S.last_scoreboard_order;
+    for (int pos = 0; pos < (int)order.size(); ++pos) {
+        const string &name = order[pos];
         const Team &t = S.teams.at(name);
-        cout << t.name << ' ' << rank_idx.at(t.name) << ' ' << t.solved_visible << ' ' << t.penalty_visible;
-        // problems A..(A+M-1)
+        cout << t.name << ' ' << (pos+1) << ' ' << t.solved_visible << ' ' << t.penalty_visible;
         for (int i = 0; i < S.M; ++i) {
             const auto &ps = t.probs[i];
             cout << ' ';
@@ -134,11 +128,9 @@ static void print_scoreboard(const SystemState &S) {
                 else cout << '+' << x;
             } else {
                 int x = ps.wrong_before;
-                if (!ps.solved) {
-                    if (x == 0 && !ps.attempted_pre_freeze) cout << '.';
-                    else if (x == 0) cout << "-0"; // display -0 only if attempted but no wrongs
-                    else cout << '-' << x;
-                }
+                if (x == 0 && !ps.attempted_pre_freeze) cout << '.';
+                else if (x == 0) cout << "-0";
+                else cout << '-' << x;
             }
         }
         cout << '\n';
@@ -237,7 +229,10 @@ int main() {
                     if (!ps.solved) {
                         ps.solved = true;
                         ps.solve_time = time;
-                        // wrong_before already counted
+                        t.solved_visible += 1;
+                        t.penalty_visible += 20LL * ps.wrong_before + ps.solve_time;
+                        t.solve_times_desc.push_back(ps.solve_time);
+                        sort(t.solve_times_desc.begin(), t.solve_times_desc.end(), greater<int>());
                     }
                 } else {
                     if (!ps.solved) {
@@ -248,6 +243,7 @@ int main() {
             // No output
         } else if (cmd == "FLUSH") {
             cout << "[Info]Flush scoreboard.\n";
+            // Recompute visible metrics incrementally: no-op here since we update on each SUBMIT/SCROLL
             flush_scoreboard(S);
         } else if (cmd == "FREEZE") {
             if (!S.frozen) {
@@ -261,57 +257,60 @@ int main() {
                 cout << "[Error]Scroll failed: scoreboard has not been frozen.\n";
             } else {
                 cout << "[Info]Scroll scoreboard.\n";
-                // Output scoreboard before scrolling (after flushing)
+                // Before scrolling: flush and print the current scoreboard
                 flush_scoreboard(S);
                 print_scoreboard(S);
 
-                // Perform iterative unfreeze: while any team has frozen_indices non-empty
-                // Always pick lowest-ranked team with frozen problems, and smallest problem index
-                // After each unfreeze, recompute rankings; if ranking increases (team moves up), and position changed, print a line per each jump? The spec says output each unfreeze that causes a ranking change, one per line, using immediate pair names.
-                // We'll detect immediate swap upward steps and print pair: team_name1 (the moving team) team_name2 (the team it overtook), solved_number and penalty_time after update.
+                // Local references for ordering and index mapping
+                vector<string> &order = S.last_scoreboard_order;
+                unordered_map<string,int> idx;
+                idx.reserve(order.size()*2);
+                for (int i = 0; i < (int)order.size(); ++i) idx[order[i]] = i;
 
-                // Build helper to get current order index map
-                auto get_rank_idx = [&]() {
-                    unordered_map<string,int> r;
-                    for (int i = 0; i < (int)S.last_scoreboard_order.size(); ++i) r[S.last_scoreboard_order[i]] = i;
-                    return r;
+                // Helper comparator using current visible metrics
+                auto better = [&](const string &a, const string &b) -> bool {
+                    const Team &A = S.teams[a];
+                    const Team &B = S.teams[b];
+                    if (A.solved_visible != B.solved_visible) return A.solved_visible > B.solved_visible;
+                    if (A.penalty_visible != B.penalty_visible) return A.penalty_visible < B.penalty_visible;
+                    const auto &ta = A.solve_times_desc, &tb = B.solve_times_desc;
+                    size_t n = min(ta.size(), tb.size());
+                    for (size_t i = 0; i < n; ++i) {
+                        if (ta[i] != tb[i]) return ta[i] < tb[i];
+                    }
+                    return A.name < B.name;
                 };
 
-                while (true) {
-                    // find lowest-ranked team with frozen problems
-                    int chosen_rank = -1;
-                    string chosen_team;
-                    int chosen_prob = -1;
-                    for (int i = (int)S.last_scoreboard_order.size()-1; i >= 0; --i) {
-                        const string &name = S.last_scoreboard_order[i];
-                        Team &t = S.teams[name];
-                        if (!t.frozen_indices.empty()) {
-                            chosen_rank = i; chosen_team = name;
-                            chosen_prob = *t.frozen_indices.begin();
-                            break;
-                        }
-                    }
-                    if (chosen_rank == -1) break; // none
+                // Build set of positions containing teams with frozen problems
+                set<int> frozen_pos;
+                for (int i = 0; i < (int)order.size(); ++i) {
+                    if (!S.teams[order[i]].frozen_indices.empty()) frozen_pos.insert(i);
+                }
 
-                    Team &t = S.teams[chosen_team];
+                while (!frozen_pos.empty()) {
+                    // Pick lowest-ranked team with frozen problems
+                    auto it = prev(frozen_pos.end());
+                    int p = *it;
+                    string tname = order[p];
+                    Team &t = S.teams[tname];
+                    int chosen_prob = *t.frozen_indices.begin();
                     auto &ps = t.probs[chosen_prob];
-                    // Apply reveal of frozen submissions for this problem
-                    // Consolidate wrong_before and solved based on previously tracked frozen counters
+
+                    // Reveal this frozen problem
                     if (ps.solved_after_unfreeze) {
-                        // first AC time is either pre-freeze solve_time or post-freeze solve time
                         if (!ps.solved) {
-                            // AC happened only after freeze; wrong attempts before first AC include pre + post wrongs until that AC
                             ps.solved = true;
                             ps.solve_time = ps.solve_time_after_unfreeze;
-                            ps.wrong_before += ps.wrong_after_unfreeze; // include post-freeze wrongs before AC
-                        } else {
-                            // already solved before freeze; post-freeze submissions ignored
+                            ps.wrong_before += ps.wrong_after_unfreeze;
+                            t.solved_visible += 1;
+                            t.penalty_visible += 20LL * ps.wrong_before + ps.solve_time;
+                            t.solve_times_desc.push_back(ps.solve_time);
+                            sort(t.solve_times_desc.begin(), t.solve_times_desc.end(), greater<int>());
                         }
                     } else {
-                        // not solved after reveal; increase wrong_before by post-freeze wrongs
                         ps.wrong_before += ps.wrong_after_unfreeze;
                     }
-                    // clear frozen markers for this problem
+                    // clear frozen markers
                     ps.is_frozen = false;
                     ps.frozen_submissions = 0;
                     ps.wrong_after_unfreeze = 0;
@@ -319,36 +318,47 @@ int main() {
                     ps.solve_time_after_unfreeze = 0;
                     t.frozen_indices.erase(chosen_prob);
 
-                    // recompute rankings
-                    auto prev_order = S.last_scoreboard_order;
-                    flush_scoreboard(S);
-                    // Check if chosen_team moved up compared to prev_order
-                    unordered_map<string,int> prev_idx;
-                    for (int i = 0; i < (int)prev_order.size(); ++i) prev_idx[prev_order[i]] = i;
-                    int old_pos = prev_idx[chosen_team];
-                    int new_pos = -1;
-                    for (int i = 0; i < (int)S.last_scoreboard_order.size(); ++i) if (S.last_scoreboard_order[i] == chosen_team) new_pos = i;
-                    if (new_pos < old_pos) {
-                        // It moved up; report the team that previously occupied the new position
-                        string replaced = prev_order[new_pos];
-                        const Team &tcur = S.teams[chosen_team];
-                        cout << chosen_team << ' ' << replaced << ' ' << tcur.solved_visible << ' ' << tcur.penalty_visible << "\n";
+                    // Bubble this team upward while its ranking improves and print per swap
+                    while (p > 0) {
+                        string prev_name = order[p-1];
+                        if (better(tname, prev_name)) {
+                            swap(order[p], order[p-1]);
+                            idx[order[p]] = p;
+                            idx[order[p-1]] = p-1;
+                            const Team &tc = S.teams[tname];
+                            cout << tname << ' ' << prev_name << ' ' << tc.solved_visible << ' ' << tc.penalty_visible << '\n';
+                            if (!S.teams[prev_name].frozen_indices.empty()) {
+                                frozen_pos.erase(p-1);
+                                frozen_pos.insert(p);
+                            }
+                            frozen_pos.erase(p);
+                            frozen_pos.insert(p-1);
+                            p--;
+                        } else {
+                            break;
+                        }
                     }
+
+                    // If this team no longer has frozen problems, remove from set
+                    if (t.frozen_indices.empty()) {
+                        frozen_pos.erase(idx[tname]);
+                    }
+
                 }
-                // After finish, output final scoreboard
+
+                // After scrolling done: print final scoreboard
                 print_scoreboard(S);
-                // lift frozen state
+                // Lift frozen state and clean residual flags
                 S.frozen = false;
-                // Clear any remaining frozen flags that might have y==0
                 for (auto &kv : S.teams) {
-                    Team &t = kv.second;
-                    t.frozen_indices.clear();
-                    for (auto &ps : t.probs) {
-                        ps.is_frozen = false;
-                        ps.frozen_submissions = 0;
-                        ps.wrong_after_unfreeze = 0;
-                        ps.solved_after_unfreeze = false;
-                        ps.solve_time_after_unfreeze = 0;
+                    Team &tt = kv.second;
+                    tt.frozen_indices.clear();
+                    for (auto &pps : tt.probs) {
+                        pps.is_frozen = false;
+                        pps.frozen_submissions = 0;
+                        pps.wrong_after_unfreeze = 0;
+                        pps.solved_after_unfreeze = false;
+                        pps.solve_time_after_unfreeze = 0;
                     }
                 }
             }
